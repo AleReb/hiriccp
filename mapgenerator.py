@@ -28,10 +28,10 @@ from branca.colormap import LinearColormap
 
 # --- API endpoint (change project/device here) ---
 API_URL_DEFAULT = (
-    "https://api-sensores.cmasccp.cl/listarDatosEstructurados"
-    "?tabla=datos&disp.id_proyecto=18&disp.codigo_interno=HIRIPRO-01"
+    "https://api-sensores.cmasccp.cl/listarDatosEstructuradosV2"
+    "?tabla=datos&disp.id_proyecto=18&disp.codigo_interno=HIRIPRO-01&limite=1000&offset=0"
 )
-
+# https://api-sensores.cmasccp.cl/listarDatosEstructuradosV2?tabla=datos&disp.id_proyecto=18&disp.codigo_interno=HIRIPRO-01&limite=1000&offset=0
 # --- Schema field names (match your API keys; rename safely here) ---
 KEY_TIME    = "fecha"
 KEY_PM25    = "PMS5003 [Material particulado PM 2.5 (µg/m³)]"
