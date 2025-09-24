@@ -1,0 +1,9 @@
+{
+  "offset": 38051,
+  "finished": true,
+  "pages": 83,
+  "limit": 500,
+  "last_error": null,
+  "last_url": "https://api-sensores.cmasccp.cl/listarDatosEstructuradosV2?tabla=datos&disp.id_proyecto=18&disp.codigo_interno=HIRIPRO-01&limite=500&offset=37552",
+  "last_ok_ts": 1758740799.4896324
+}
