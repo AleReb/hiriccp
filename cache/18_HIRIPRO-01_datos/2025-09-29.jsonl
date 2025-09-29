@@ -1,0 +1,2 @@
+{"device_code": "HIRIPRO-01", "time": "2025-09-29T12:05:11", "envio_n": "2.0", "lat": 0.0, "lon": 0.0, "pm25": 5.0, "pm1": 2.0, "pm10": 5.0, "temp_pms": 21.1, "hum": 49.0, "vbat": 3.77, "csq": 24.0, "sats": 0.0, "speed_kmh": 0.0}
+{"device_code": "HIRIPRO-01", "time": "2025-09-29T12:05:08", "envio_n": "1.0", "lat": 0.0, "lon": 0.0, "pm25": 5.0, "pm1": 2.0, "pm10": 5.0, "temp_pms": 21.1, "hum": 49.1, "vbat": 3.896, "csq": 25.0, "sats": 0.0, "speed_kmh": 0.0}
