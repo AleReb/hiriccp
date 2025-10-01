@@ -42,6 +42,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from flask import Flask, request, Response, send_file, redirect, url_for, jsonify
+from flask_socketio import SocketIO, emit
 from branca.element import Element  # added for explicit HTML injection like in serverMap.py
 
 import folium
@@ -118,6 +119,8 @@ DEFAULT_HEADERS = {"User-Agent": "HIRIMap/1.1 (requests)"}
 # =========================
 
 app = Flask(__name__)
+app.config['SECRET_KEY'] = 'hiripro_websocket_secret_2024'
+socketio = SocketIO(app, cors_allowed_origins="*", logger=True, engineio_logger=True)
 
 # Runtime state
 Logs = deque(maxlen=2000)  # small rolling log for /admin/logs
@@ -470,6 +473,16 @@ def collector_loop(key: Tuple[str,str,str], limit: int,
             added = add_to_day_cache(key, plotted)
             if sum(added.values()) > 0:
                 log(f"[collector] head append +{sum(added.values())} rows days+={list(added.keys())}")
+                # Enviar nuevos datos via WebSocket
+                try:
+                    socketio.emit('new_data', {
+                        'key': {'project_id': p, 'device_code': d, 'tabla': t},
+                        'rows': plotted,
+                        'count': sum(added.values()),
+                        'days': list(added.keys())
+                    }, namespace='/')
+                except Exception as e:
+                    log(f"[websocket] Error emitting: {e}")
             time.sleep(HEAD_POLL_SECONDS)
 
         except requests.exceptions.RequestException as e:
@@ -575,8 +588,12 @@ def map_view():
     """
     fmap.get_root().html.add_child(Element(toolbar_html))
 
-    # Include leaflet.heat plugin (needed for L.heatLayer)
+    # Include leaflet plugins and Socket.IO
     fmap.get_root().html.add_child(Element('<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.heat/0.2.0/leaflet-heat.js"></script>'))
+    fmap.get_root().html.add_child(Element('<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/leaflet.markercluster.js"></script>'))
+    fmap.get_root().html.add_child(Element('<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/MarkerCluster.css" />'))
+    fmap.get_root().html.add_child(Element('<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/MarkerCluster.Default.css" />'))
+    fmap.get_root().html.add_child(Element('<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>'))
 
     # Resizable control header (left, 50% width)
     # Device selector + admin buttons + paging controls + day/live controls
@@ -638,7 +655,12 @@ def map_view():
       <button id="btnAdminReindex" title="Rebuild cache in background">Admin: Reindex</button>
       <button id="btnAdminPurge" title="Purge on-disk/in-memory cache">Admin: Purge cache</button>
       <button id="btnToggleLogs" title="Show/hide logs">Logs</button>
-      <span id="status" style="margin-left:10px;color:#333;">Ready.</span>
+      
+      <div style="margin-left:10px; display:flex; align-items:center; gap:8px;">
+        <div id="connectionStatus" style="width:12px; height:12px; border-radius:50%; background:#gray;" title="Estado de conexión"></div>
+        <span id="status" style="color:#333;">Ready.</span>
+        <span id="dataCount" style="font-size:12px; color:#666;"></span>
+      </div>
 
       <div id="logs" style="display:none; flex-basis:100%; max-height:220px; overflow:auto; background:#fafafa; border:1px solid #ddd; padding:6px; border-radius:6px;"></div>
     </div>
@@ -663,8 +685,35 @@ def map_view():
       const $ = (sel)=>document.querySelector(sel);
       const $$ = (sel)=>Array.from(document.querySelectorAll(sel));
       const show = (el, on)=>{ el.style.display = on ? '' : 'none'; };
-      const setStatus = (msg)=>{ const s = $('#status'); if(s) s.textContent = msg; };
+      const setStatus = (msg, type='info')=>{ 
+        const s = $('#status'); 
+        if(s) s.textContent = msg; 
+        updateConnectionIndicator(type);
+      };
       const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
+      
+      function updateConnectionIndicator(type = 'info') {
+        const indicator = $('#connectionStatus');
+        if(!indicator) return;
+        
+        const colors = {
+          'connected': '#22c55e',    // verde - WebSocket activo
+          'polling': '#eab308',     // amarillo - solo polling
+          'error': '#ef4444',       // rojo - error
+          'info': '#6b7280'         // gris - info general
+        };
+        
+        indicator.style.background = colors[type] || colors.info;
+      }
+      
+      let totalDataPoints = 0;
+      function updateDataCounter(newCount = 0) {
+        totalDataPoints += newCount;
+        const counter = $('#dataCount');
+        if(counter) {
+          counter.textContent = `${totalDataPoints} puntos en mapa`;
+        }
+      }
 
       let map = null;
       function findMapVar(){
@@ -687,11 +736,13 @@ def map_view():
 
       // Layers and state
       let pointLayer = null;      // L.LayerGroup of CircleMarkers
+      let clusterLayer = null;    // L.MarkerClusterGroup for clustering
       let heatLayer = null;       // L.heatLayer
       let heatData = [];          // [[lat,lon,val], ...]
       let lastTs = null;          // last timestamp of current-day load (for Live)
       let currentDay = null;      // YYYY-MM-DD currently loaded
       let currentBBox = null;     // for fitBounds after updates
+      let useCluster = false;     // toggle clustering based on point count
 
       // Palette helpers
       const BR = CFG.palette.breaks;
@@ -706,17 +757,56 @@ def map_view():
 
       function clearLayers(){
         if(pointLayer){ pointLayer.clearLayers(); }
+        if(clusterLayer){ clusterLayer.clearLayers(); }
         if(heatLayer){ heatData = []; heatLayer.setLatLngs(heatData); }
         currentBBox = null;
       }
       function ensureLayers(){
-        if(!pointLayer){ pointLayer = L.layerGroup().addTo(map); }
+        if(!pointLayer){ pointLayer = L.layerGroup(); }
+        if(!clusterLayer && window.L && L.markerClusterGroup){
+          clusterLayer = L.markerClusterGroup({
+            maxClusterRadius: 50,
+            spiderfyOnMaxZoom: true,
+            showCoverageOnHover: false,
+            zoomToBoundsOnClick: true
+          });
+        }
         if(!heatLayer){
           if(!L.heatLayer){
             console.warn('leaflet.heat plugin not loaded; heat map disabled');
           }else{
             heatLayer = L.heatLayer([], {radius:12, blur:22, minOpacity:0.3, maxZoom:18}).addTo(map);
           }
+        }
+      }
+      
+      function switchToClusterMode(enable) {
+        if(enable === useCluster) return; // no change needed
+        
+        if(enable && clusterLayer) {
+          // Switch to cluster mode
+          if(map.hasLayer(pointLayer)) map.removeLayer(pointLayer);
+          if(!map.hasLayer(clusterLayer)) map.addLayer(clusterLayer);
+          // Move all markers from pointLayer to clusterLayer
+          pointLayer.eachLayer(layer => {
+            pointLayer.removeLayer(layer);
+            clusterLayer.addLayer(layer);
+          });
+          useCluster = true;
+          console.log('Switched to cluster mode');
+        } else {
+          // Switch to regular mode
+          if(map.hasLayer(clusterLayer)) map.removeLayer(clusterLayer);
+          if(!map.hasLayer(pointLayer)) map.addLayer(pointLayer);
+          // Move all markers from clusterLayer to pointLayer
+          if(clusterLayer) {
+            clusterLayer.eachLayer(layer => {
+              clusterLayer.removeLayer(layer);
+              pointLayer.addLayer(layer);
+            });
+          }
+          useCluster = false;
+          console.log('Switched to regular mode');
         }
       }
       function extendBBox(lat, lon){
@@ -726,13 +816,16 @@ def map_view():
         currentBBox[1][0] = Math.max(currentBBox[1][0], lat);
         currentBBox[1][1] = Math.max(currentBBox[1][1], lon);
       }
-      function fitIfBBox(){
+      function fitIfBounds(){
         if(currentBBox){ map.fitBounds(currentBBox, {padding:[20,20]}); }
       }
 
       function addRows(rows, replace){
         ensureLayers();
-        if(replace) clearLayers();
+        if(replace) { 
+          clearLayers(); 
+          totalDataPoints = 0; // reset counter
+        }
         let added = 0;
         for(const r of rows){
           const lat = +r.lat, lon = +r.lon, pm25 = +r.pm25;
@@ -754,13 +847,25 @@ def map_view():
           const m = L.circleMarker([lat,lon], {
             radius: 6, color: col, fillColor: col, weight: 1, fillOpacity: 0.85
           }).bindPopup(popup);
-          m.addTo(pointLayer);
+          
+          // Add to appropriate layer
+          if(useCluster && clusterLayer) {
+            clusterLayer.addLayer(m);
+          } else {
+            pointLayer.addLayer(m);
+          }
           heatData.push([lat,lon, Math.max(BR[0], Math.min(BR[BR.length-1], pm25))]);
           extendBBox(lat, lon);
           added++;
         }
         if(heatLayer) heatLayer.setLatLngs(heatData);
-        if(replace) fitIfBBox();
+        if(replace) fitIfBounds();
+        
+        // Auto-switch clustering based on point count
+        const shouldCluster = totalDataPoints + added > 100;
+        switchToClusterMode(shouldCluster);
+        
+        updateDataCounter(added);
         return added;
       }
 
@@ -846,6 +951,11 @@ def map_view():
         finally{ showSpin(false); }
       }
 
+      let liveInterval = null;
+      let consecutiveEmptyPolls = 0;
+      const BASE_POLL_INTERVAL = 10000; // 10 segundos base
+      const MAX_POLL_INTERVAL = 60000;  // máximo 60 segundos
+      
       async function pollLive(){
         if(!$('#chkLive').checked || !currentDay || !lastTs) return;
         try{
@@ -858,11 +968,86 @@ def map_view():
           if(rows.length){
             const added = addRows(rows, false);
             for(const r of rows){ if(r.time && (!lastTs || r.time > lastTs)) lastTs = r.time; }
-            setStatus(`Live +${rows.length} (added=${added})`);
+            setStatus(`Live +${rows.length} (added=${added}) - ${new Date().toLocaleTimeString()}`, wsConnected ? 'connected' : 'polling');
+            consecutiveEmptyPolls = 0;
+            adjustPollingInterval(); // acelerar cuando hay datos
+          } else {
+            consecutiveEmptyPolls++;
+            adjustPollingInterval(); // ralentizar si no hay datos
+            setStatus(`Live mode - Última actualización: ${new Date().toLocaleTimeString()}`, wsConnected ? 'connected' : 'polling');
           }
-        }catch(e){ /* silent */ }
+        }catch(e){ 
+          setStatus(`Error de conexión: ${e.message}`, 'error');
+          consecutiveEmptyPolls++;
+        }
       }
-      setInterval(pollLive, 15000);
+      
+      function adjustPollingInterval() {
+        if(liveInterval) clearInterval(liveInterval);
+        
+        // Si hay datos recientes, polling más frecuente
+        let interval = BASE_POLL_INTERVAL;
+        if(consecutiveEmptyPolls > 0) {
+          // Incrementar gradualmente si no hay datos
+          interval = Math.min(MAX_POLL_INTERVAL, BASE_POLL_INTERVAL * (1 + consecutiveEmptyPolls * 0.5));
+        }
+        
+        liveInterval = setInterval(pollLive, interval);
+        console.log(`Polling interval adjusted to ${interval/1000}s (empty polls: ${consecutiveEmptyPolls})`);
+      }
+      
+      // Inicializar polling (como fallback)
+      adjustPollingInterval();
+
+      // ====== WebSocket Setup ======
+      let socket = null;
+      let wsConnected = false;
+      
+      function initWebSocket() {
+        if(!window.io) {
+          console.warn('Socket.IO not loaded, using polling fallback');
+          return;
+        }
+        
+        socket = io(location.origin);
+        
+        socket.on('connect', () => {
+          console.log('WebSocket connected');
+          wsConnected = true;
+          setStatus('Conectado en tiempo real', 'connected');
+          // Suscribirse a updates del dispositivo actual
+          socket.emit('subscribe', {
+            project_id: $('#project_id').value,
+            device_code: $('#device_code').value,
+            tabla: $('#tabla').value
+          });
+        });
+        
+        socket.on('disconnect', () => {
+          console.log('WebSocket disconnected');
+          wsConnected = false;
+          setStatus('Desconectado - usando polling', 'polling');
+        });
+        
+        socket.on('new_data', (data) => {
+          console.log('Received new data via WebSocket:', data);
+          if(data.rows && data.rows.length > 0 && $('#chkLive').checked) {
+            const added = addRows(data.rows, false);
+            // Actualizar lastTs para sincronización
+            for(const r of data.rows){ 
+              if(r.time && (!lastTs || r.time > lastTs)) lastTs = r.time; 
+            }
+            setStatus(`🟢 WebSocket +${data.count} nuevos - ${new Date().toLocaleTimeString()}`);
+            
+            // Reducir polling cuando WebSocket funciona
+            consecutiveEmptyPolls = 0;
+          }
+        });
+        
+        socket.on('status', (data) => {
+          console.log('WebSocket status:', data.message);
+        });
+      }
 
       // Spinner (minimal)
       function showSpin(on){
@@ -956,6 +1141,7 @@ def map_view():
         try{
           await waitForMap();
           setStatus('Map ready.');
+          initWebSocket(); // Inicializar WebSocket
           const di = await refreshDayIndex(true);
           if(di && di.selected){ await loadDay(di.selected, true); }
           updatePageDownloads($('#limit').value, $('#offset').value);
@@ -1213,6 +1399,26 @@ def admin_logs():
 def healthz():
     return jsonify({"ok": True})
 
+# ---- WebSocket events ----
+
+@socketio.on('connect')
+def handle_connect():
+    log(f"[websocket] Client connected: {request.sid}")
+    emit('status', {'message': 'Connected to HIRI live updates'})
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    log(f"[websocket] Client disconnected: {request.sid}")
+
+@socketio.on('subscribe')
+def handle_subscribe(data):
+    """Client subscribes to updates for specific device"""
+    project_id = data.get('project_id')
+    device_code = data.get('device_code')
+    tabla = data.get('tabla')
+    log(f"[websocket] Client {request.sid} subscribed to {project_id}/{device_code}/{tabla}")
+    emit('subscribed', {'project_id': project_id, 'device_code': device_code, 'tabla': tabla})
+
 # =========================
 # ========= MAIN ==========
 # =========================
@@ -1221,4 +1427,4 @@ if __name__ == "__main__":
     os.makedirs(CACHE_ROOT, exist_ok=True)
     # Start default collector on boot
     start_collector(DEFAULT_PROJECT_ID, DEFAULT_DEVICE_CODE, DEFAULT_TABLA, DEFAULT_LIMIT, reset=False)
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    socketio.run(app, host="127.0.0.1", port=5000, debug=True, allow_unsafe_werkzeug=True)
