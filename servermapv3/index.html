@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HIRI Map - {{project_id}}/{{device_code}}</title>
+
+    <!-- Leaflet MarkerCluster CSS -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/MarkerCluster.css" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/MarkerCluster.Default.css" />
+
+    <!-- Custom Styles -->
+    <link rel="stylesheet" href="/static/styles.css">
+
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+        }
+        #map-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+        }
+    </style>
+</head>
+<body>
+    <!-- Map Container (background) -->
+    <div id="map-container">
+        {{folium_map|safe}}
+    </div>
+
+    <!-- Control Panel (overlay) -->
+    <div id="controls">
+      <div style="font-weight:700;">HIRI Map</div>
+
+      <label>Project:
+        <input type="text" id="project_id" value="{{project_id}}" style="width:70px;margin-left:4px;">
+      </label>
+
+      <label>Device:
+        <input id="device_code" list="deviceList" value="{{device_code}}" style="width:120px;margin-left:4px;">
+        <datalist id="deviceList">
+          <option value="HIRIPRO-01">
+          <option value="HIRIPRO-02">
+          <option value="HIRIPRO-03">
+          <option value="HIRIPRO-04">
+          <option value="HIRIPRO-05">
+        </datalist>
+      </label>
+
+      <label>Tabla:
+        <input type="text" id="tabla" value="{{tabla}}" style="width:80px;margin-left:4px;">
+      </label>
+
+      <button id="btnApply">Apply</button>
+      <button id="btnCollapse" title="Collapse/expand panel">⇕</button>
+
+      <span style="flex-basis:100%; height:0;"></span>
+
+      <label>Limit:
+        <input type="number" id="limit" value="{{default_limit}}" min="50" max="2000" step="50" style="width:80px;margin-left:6px;">
+      </label>
+      <label>Offset:
+        <input type="number" id="offset" value="0" min="0" step="10" style="width:90px;margin-left:6px;">
+      </label>
+      <button id="btnLoad">Load</button>
+      <button id="btnOlderAppend">Append older</button>
+      <button id="btnOlder">Older</button>
+      <button id="btnNewer">Newer</button>
+      <button id="btnReset">Reset</button>
+
+      <span style="flex-basis:100%; height:0;"></span>
+
+      <label>Day:
+        <select id="daySelect" style="min-width:140px;"></select>
+      </label>
+      <button id="btnLoadDay">Load day</button>
+      <button id="btnPrevDay">◀ Prev</button>
+      <button id="btnNextDay">Next ▶</button>
+      <label style="margin-left:8px;">
+        <input type="checkbox" id="chkLive"> Live
+      </label>
+      <button id="btnRefreshDays">Refresh days</button>
+
+      <span style="flex-basis:100%; height:0;"></span>
+
+      <button id="btnAdminReindex" title="Rebuild cache in background">Admin: Reindex</button>
+      <button id="btnAdminPurge" title="Purge on-disk/in-memory cache">Admin: Purge cache</button>
+      <button id="btnToggleLogs" title="Show/hide logs">Logs</button>
+
+      <div style="margin-left:10px; display:flex; align-items:center; gap:8px;">
+        <div id="connectionStatus" style="width:12px; height:12px; border-radius:50%; background:#gray;" title="Estado de conexión"></div>
+        <span id="status" style="color:#333;">Ready.</span>
+        <span id="dataCount" style="font-size:12px; color:#666;"></span>
+      </div>
+
+      <div id="logs" style="display:none; flex-basis:100%; max-height:220px; overflow:auto; background:#fafafa; border:1px solid #ddd; padding:6px; border-radius:6px;"></div>
+    </div>
+
+    <!-- Downloads Toolbar (overlay) -->
+    <div id="dlbar">
+      <b>Downloads</b><br>
+      <div style="margin-top:6px;">
+        <span style="font-weight:600;">Page mode:</span>
+        <a id="dl-raw-csv" href="#">CSV</a> |
+        <a id="dl-raw-xlsx" href="#">Excel</a> |
+        <a id="dl-plot-csv" href="#">Plotted CSV</a> |
+        <a id="dl-plot-xlsx" href="#">Plotted Excel</a>
+      </div>
+      <div style="margin-top:6px;">
+        <span style="font-weight:600;">Day exports:</span>
+        <a id="dl-day-csv" href="#">CSV</a> |
+        <a id="dl-day-xlsx" href="#">Excel</a>
+      </div>
+    </div>
+
+    <!-- Leaflet Heat Plugin (Folium already includes Leaflet) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.heat/0.2.0/leaflet-heat.js"></script>
+
+    <!-- Leaflet MarkerCluster Plugin -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/leaflet.markercluster.js"></script>
+
+    <!-- Socket.IO -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
+
+    <!-- Configuration -->
+    <script>
+        const CFG = {{config|tojson}};
+    </script>
+
+    <!-- Main Application JS -->
+    <script src="/static/codigomapa.js"></script>
+</body>
+</html>
