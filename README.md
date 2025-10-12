@@ -162,7 +162,7 @@ This project is licensed under the Creative Commons Attribution-NonCommercial-Sh
 ## Contributors
 
 - **Ale Rebolledo** (arebolledo@udd.cl)
-- Co-Authored-By: Claude (Anthropic)
+- Co-Authored-By: todos los que le dan fork y son remergeados al reppo!
 
 ## Disclaimer
 
