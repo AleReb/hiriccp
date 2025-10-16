@@ -471,6 +471,71 @@
     if(c.style.height === '28px'){ c.style.height = ''; } else { c.style.height = '28px'; }
   });
 
+  // CSV Upload functionality
+  $('#btnUploadCSV').addEventListener('click', ()=>{
+    $('#csvFileInput').click();
+  });
+
+  $('#csvFileInput').addEventListener('change', async (event)=>{
+    const file = event.target.files[0];
+    if(!file) return;
+
+    if(!file.name.toLowerCase().endsWith('.csv')){
+      alert('Por favor selecciona un archivo CSV válido');
+      return;
+    }
+
+    const formData = new FormData();
+    formData.append('csvfile', file);
+
+    try{
+      setStatus('Subiendo CSV...', 'info');
+      
+      const response = await fetch('/upload-csv', {
+        method: 'POST',
+        body: formData
+      });
+
+      const result = await response.json();
+
+      if(result.status === 'success'){
+        setStatus(`CSV procesado: ${result.valid_rows} puntos válidos`, 'connected');
+        
+        // Show success dialog with download option
+        const download = confirm(
+          `¡CSV procesado exitosamente!\n\n` +
+          `Archivo: ${result.filename}\n` +
+          `Total filas: ${result.total_rows}\n` +
+          `Puntos válidos: ${result.valid_rows}\n` +
+          `Columnas: ${result.columns.join(', ')}\n\n` +
+          `¿Deseas descargar el mapa HTML ahora?`
+        );
+
+        if(download){
+          // Create download link and trigger it
+          const downloadUrl = `/generate-map/${result.upload_id}`;
+          const link = document.createElement('a');
+          link.href = downloadUrl;
+          link.download = `mapa_pm25_${new Date().toISOString().slice(0,19).replace(/[T:]/g, '_')}.html`;
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          
+          setStatus('Mapa HTML descargado', 'connected');
+        }
+      } else {
+        setStatus(`Error: ${result.message}`, 'error');
+        alert(`Error procesando CSV:\n${result.message}`);
+      }
+    } catch(error) {
+      setStatus(`Error de conexión: ${error.message}`, 'error');
+      alert(`Error de conexión:\n${error.message}`);
+    }
+
+    // Reset file input
+    event.target.value = '';
+  });
+
   // Boot
   (async ()=>{
     try{

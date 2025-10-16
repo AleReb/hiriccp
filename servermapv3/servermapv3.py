@@ -42,8 +42,9 @@ from flask import Flask, request, Response, send_file, redirect, url_for, jsonif
 from flask_socketio import SocketIO, emit
 
 import folium
-from folium.plugins import Fullscreen, MiniMap
+from folium.plugins import Fullscreen, MiniMap, HeatMap
 from branca.colormap import LinearColormap
+from branca.element import Element
 
 # =========================
 # ======== CONFIG =========
@@ -270,6 +271,120 @@ def process_raw_to_plotted(raw_rows: List[Dict[str,Any]]) -> List[Dict[str,Any]]
             "speed_kmh": to_float(row.get(KEY_SIM_SPEED)),
         })
     return out
+
+# =========================
+# ===== CSV MAP GENERATOR =
+# =========================
+
+def clamp_pm25(v: float) -> float:
+    """Clamp PM2.5 to the configured colormap domain to avoid out-of-range artifacts."""
+    return max(PM_BREAKS[0], min(PM_BREAKS[-1], float(v)))
+
+def build_popup_from_plotted(row: Dict[str, Any], lat: float, lon: float, pm25_val: float) -> str:
+    """HTML popup content for plotted data."""
+    def safe_val(v: Any) -> str:
+        return "-" if v in (None, "", "null") else str(v)
+
+    return (
+        f"<b>Dispositivo:</b> {safe_val(row.get('device_code'))}<br>"
+        f"<b>PM2.5:</b> {pm25_val:.1f} µg/m³<br>"
+        f"<b>Time:</b> {safe_val(row.get('time'))}<br>"
+        f"<b>Envíos #:</b> {safe_val(row.get('envio_n'))}<br>"
+        f"<b>Lat:</b> {lat:.6f}, <b>Lon:</b> {lon:.6f}<br>"
+        f"<hr style='margin:4px 0'/>"
+        f"<b>PM1:</b> {safe_val(row.get('pm1'))} | "
+        f"<b>PM10:</b> {safe_val(row.get('pm10'))}<br>"
+        f"<b>Temp PMS:</b> {safe_val(row.get('temp_pms'))} °C | "
+        f"<b>Hum:</b> {safe_val(row.get('hum'))} %<br>"
+        f"<b>VBat:</b> {safe_val(row.get('vbat'))} V<br>"
+        f"<b>CSQ:</b> {safe_val(row.get('csq'))} | "
+        f"<b>Sats:</b> {safe_val(row.get('sats'))} | "
+        f"<b>Speed:</b> {safe_val(row.get('speed_kmh'))} km/h"
+    )
+
+def gradient_from_cmap(cm: LinearColormap, steps: int = 256) -> dict:
+    """Build a 0..1 gradient dict for Leaflet.Heat from the same colormap."""
+    return {i/(steps-1): cm(cm.vmin + (cm.vmax-cm.vmin)*i/(steps-1))
+            for i in range(steps)}
+
+def generate_html_map_from_csv_data(plotted_records: List[Dict[str, Any]], title: str = "HIRI PM2.5 Map") -> str:
+    """Generate a complete HTML map from plotted CSV data."""
+    if not plotted_records:
+        raise ValueError("No valid data points to plot")
+
+    df = pd.DataFrame(plotted_records)
+    
+    # Color map: one scale for points, legend, and heatmap
+    cmap = LinearColormap(colors=PM_COLORS, vmin=PM_BREAKS[0], vmax=PM_BREAKS[-1]).to_step(index=PM_BREAKS)
+    cmap.caption = COLORBAR_CAPTION
+    heat_gradient = gradient_from_cmap(cmap, steps=8)
+
+    # Create Folium map
+    fmap = folium.Map(
+        location=[df["lat"].iloc[0], df["lon"].iloc[0]], 
+        zoom_start=16, 
+        control_scale=True
+    )
+
+    # Points layer
+    fg_points = folium.FeatureGroup(name="PM2.5 points", overlay=True, control=True)
+    for _, r in df.iterrows():
+        val = clamp_pm25(float(r["pm25"]))
+        color = cmap(val)
+
+        popup_html = build_popup_from_plotted(
+            r.to_dict(), float(r["lat"]), float(r["lon"]), float(r["pm25"])
+        )
+
+        folium.CircleMarker(
+            location=[r["lat"], r["lon"]],
+            radius=6,
+            popup=folium.Popup(popup_html, max_width=360),
+            color=color,
+            weight=1,
+            fill=True,
+            fill_color=color,
+            fill_opacity=0.85,
+        ).add_to(fg_points)
+
+    fg_points.add_to(fmap)
+
+    # HeatMap layer
+    HeatMap(
+        df.assign(pm25=df["pm25"].apply(clamp_pm25))[["lat", "lon", "pm25"]].values.tolist(),
+        name="HeatMap PM2.5",
+        min_opacity=0.30,
+        radius=12,
+        blur=22,
+        max_zoom=18,
+        gradient=heat_gradient,
+    ).add_to(fmap)
+
+    # Legend + controls
+    cmap.add_to(fmap)
+    Fullscreen(position="topleft").add_to(fmap)
+    MiniMap(toggle_display=True).add_to(fmap)
+    folium.LayerControl(collapsed=False).add_to(fmap)
+
+    # Fit to all points (auto-zoom)
+    sw = [float(df["lat"].min()), float(df["lon"].min())]
+    ne = [float(df["lat"].max()), float(df["lon"].max())]
+    fmap.fit_bounds([sw, ne], padding=(20, 20))
+
+    # Add title
+    title_html = f"""
+    <div style="position: fixed; top: 10px; left: 50%; transform: translateX(-50%); z-index: 9999;
+                background: rgba(255,255,255,0.9); padding: 8px 16px; border-radius: 8px;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.15); font-family: system-ui, sans-serif;">
+        <h3 style="margin: 0; color: #333;">{title}</h3>
+        <p style="margin: 2px 0 0 0; font-size: 12px; color: #666;">
+            {len(df)} puntos de datos - Generado: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        </p>
+    </div>
+    """
+    Element(title_html).add_to(fmap)
+
+    return fmap.get_root().render()
 
 # =========================
 # ===== COLLECTOR =========
@@ -581,6 +696,12 @@ def map_view():
         <a id="dl-day-csv" href="#">CSV</a> |
         <a id="dl-day-xlsx" href="#">Excel</a>
       </div>
+      <div style="margin-top:6px;">
+        <span style="font-weight:600;">CSV to Map:</span>
+        <input type="file" id="csvFileInput" accept=".csv" style="display:none;">
+        <button id="btnUploadCSV" style="font-size:12px; padding:4px 8px;">Cargar CSV</button>
+        <br><small style="color:#666;">Genera mapa HTML descargable</small>
+      </div>
     </div>
     """
     fmap.get_root().html.add_child(Element(toolbar_html))
@@ -827,6 +948,252 @@ def admin_logs():
 @app.route("/healthz")
 def healthz():
     return jsonify({"ok": True})
+
+# ---- CSV Upload and Map Generation ----
+
+@app.route("/upload-csv", methods=["POST"])
+def upload_csv():
+    """Handle CSV file upload and return processed data info."""
+    try:
+        if 'csvfile' not in request.files:
+            return jsonify({"status": "error", "message": "No file uploaded"}), 400
+        
+        file = request.files['csvfile']
+        if file.filename == '':
+            return jsonify({"status": "error", "message": "No file selected"}), 400
+        
+        if not file.filename.lower().endswith('.csv'):
+            return jsonify({"status": "error", "message": "File must be a CSV"}), 400
+
+        # Read CSV
+        try:
+            df = pd.read_csv(file)
+        except Exception as e:
+            return jsonify({"status": "error", "message": f"Error reading CSV: {str(e)}"}), 400
+
+        # Validate required columns
+        required_cols = ['lat', 'lon', 'pm25']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            return jsonify({
+                "status": "error", 
+                "message": f"Missing required columns: {missing_cols}. Available: {list(df.columns)}"
+            }), 400
+
+        # Filter valid rows
+        df_valid = df.dropna(subset=required_cols)
+        df_valid = df_valid[(df_valid['lat'].between(-90, 90)) & 
+                           (df_valid['lon'].between(-180, 180)) & 
+                           (df_valid['pm25'] >= 0)]
+
+        if len(df_valid) == 0:
+            return jsonify({
+                "status": "error", 
+                "message": "No valid data points found (need lat, lon, pm25 with valid values)"
+            }), 400
+
+        # Store in session or temporary storage for map generation
+        # For simplicity, we'll generate a unique ID and store temporarily
+        import uuid
+        upload_id = str(uuid.uuid4())
+        
+        # Store in a simple dict (in production, use Redis or database)
+        if not hasattr(app, 'csv_uploads'):
+            app.csv_uploads = {}
+        
+        app.csv_uploads[upload_id] = {
+            'data': df_valid.to_dict('records'),
+            'filename': file.filename,
+            'uploaded_at': datetime.now(),
+            'total_rows': len(df),
+            'valid_rows': len(df_valid)
+        }
+
+        return jsonify({
+            "status": "success",
+            "upload_id": upload_id,
+            "filename": file.filename,
+            "total_rows": len(df),
+            "valid_rows": len(df_valid),
+            "columns": list(df.columns),
+            "message": f"CSV processed successfully. {len(df_valid)} valid data points ready for mapping."
+        })
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Server error: {str(e)}"}), 500
+
+@app.route("/generate-map/<upload_id>")
+def generate_map_from_csv(upload_id: str):
+    """Generate and download HTML map from uploaded CSV data."""
+    try:
+        # Check if upload exists
+        if not hasattr(app, 'csv_uploads') or upload_id not in app.csv_uploads:
+            return Response("Upload not found or expired", status=404)
+
+        upload_data = app.csv_uploads[upload_id]
+        plotted_records = upload_data['data']
+        filename = upload_data['filename']
+
+        # Generate HTML map
+        title = f"Mapa PM2.5 - {filename}"
+        html_content = generate_html_map_from_csv_data(plotted_records, title)
+
+        # Create filename for download
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        map_filename = f"mapa_pm25_{ts}.html"
+
+        # Clean up old uploads (keep last 10)
+        if len(app.csv_uploads) > 10:
+            oldest_keys = sorted(app.csv_uploads.keys(), 
+                               key=lambda k: app.csv_uploads[k]['uploaded_at'])[:5]
+            for old_key in oldest_keys:
+                del app.csv_uploads[old_key]
+
+        return Response(
+            html_content,
+            mimetype='text/html',
+            headers={
+                'Content-Disposition': f'attachment; filename="{map_filename}"'
+            }
+        )
+
+    except Exception as e:
+        log(f"[map-gen] Error generating map for {upload_id}: {e}")
+        return Response(f"Error generating map: {str(e)}", status=500)
+
+@app.route("/csv-upload-form")
+def csv_upload_form():
+    """Simple upload form for testing."""
+    form_html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>CSV to Map Generator</title>
+        <style>
+            body { font-family: system-ui, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; }
+            .form-group { margin: 15px 0; }
+            label { display: block; margin-bottom: 5px; font-weight: bold; }
+            input[type="file"] { width: 100%; padding: 8px; }
+            button { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; }
+            button:hover { background: #0056b3; }
+            .info { background: #f8f9fa; padding: 15px; border-radius: 4px; margin: 15px 0; }
+            .result { margin-top: 20px; padding: 15px; border-radius: 4px; }
+            .success { background: #d4edda; border: 1px solid #c3e6cb; color: #155724; }
+            .error { background: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; }
+        </style>
+    </head>
+    <body>
+        <h1>📊 Generador de Mapas desde CSV</h1>
+        
+        <div class="info">
+            <h3>📋 Requisitos del CSV:</h3>
+            <ul>
+                <li><strong>Columnas obligatorias:</strong> <code>lat</code>, <code>lon</code>, <code>pm25</code></li>
+                <li><strong>Columnas opcionales:</strong> <code>time</code>, <code>device_code</code>, <code>envio_n</code>, 
+                    <code>pm1</code>, <code>pm10</code>, <code>temp_pms</code>, <code>hum</code>, <code>vbat</code>, 
+                    <code>csq</code>, <code>sats</code>, <code>speed_kmh</code></li>
+                <li><strong>Formato:</strong> Archivo .csv con encabezados</li>
+                <li><strong>Datos válidos:</strong> lat (-90 a 90), lon (-180 a 180), pm25 ≥ 0</li>
+            </ul>
+        </div>
+
+        <form id="csvForm" enctype="multipart/form-data">
+            <div class="form-group">
+                <label for="csvfile">Seleccionar archivo CSV:</label>
+                <input type="file" id="csvfile" name="csvfile" accept=".csv" required>
+            </div>
+            <button type="submit">📤 Cargar y Generar Mapa</button>
+        </form>
+
+        <div id="result"></div>
+
+        <script>
+        document.getElementById('csvForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const formData = new FormData();
+            const fileInput = document.getElementById('csvfile');
+            formData.append('csvfile', fileInput.files[0]);
+            
+            const resultDiv = document.getElementById('result');
+            resultDiv.innerHTML = '<p>⏳ Procesando archivo...</p>';
+            
+            try {
+                const response = await fetch('/upload-csv', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    resultDiv.innerHTML = `
+                        <div class="result success">
+                            <h3>✅ ¡Archivo procesado exitosamente!</h3>
+                            <p><strong>Archivo:</strong> ${result.filename}</p>
+                            <p><strong>Total filas:</strong> ${result.total_rows}</p>
+                            <p><strong>Puntos válidos:</strong> ${result.valid_rows}</p>
+                            <p><strong>Columnas:</strong> ${result.columns.join(', ')}</p>
+                            <br>
+                            <a href="/generate-map/${result.upload_id}" download>
+                                <button>🗺️ Descargar Mapa HTML</button>
+                            </a>
+                        </div>
+                    `;
+                } else {
+                    resultDiv.innerHTML = `
+                        <div class="result error">
+                            <h3>❌ Error</h3>
+                            <p>${result.message}</p>
+                        </div>
+                    `;
+                }
+            } catch (error) {
+                resultDiv.innerHTML = `
+                    <div class="result error">
+                        <h3>❌ Error de conexión</h3>
+                        <p>${error.message}</p>
+                    </div>
+                `;
+            }
+        });
+        </script>
+    </body>
+    </html>
+    """
+    return Response(form_html, mimetype='text/html')
+
+@app.route("/csv-info")
+def csv_info():
+    """API endpoint with CSV format information."""
+    return jsonify({
+        "csv_format": {
+            "required_columns": ["lat", "lon", "pm25"],
+            "optional_columns": [
+                "time", "device_code", "envio_n", "pm1", "pm10", 
+                "temp_pms", "hum", "vbat", "csq", "sats", "speed_kmh"
+            ],
+            "data_types": {
+                "lat": "float (-90 to 90)",
+                "lon": "float (-180 to 180)", 
+                "pm25": "float (>= 0)",
+                "time": "string (ISO format preferred)",
+                "device_code": "string",
+                "envio_n": "integer",
+                "pm1": "float",
+                "pm10": "float",
+                "temp_pms": "float",
+                "hum": "float (0-100)",
+                "vbat": "float",
+                "csq": "integer",
+                "sats": "integer",
+                "speed_kmh": "float"
+            },
+            "example_csv": """lat,lon,pm25,time,device_code,pm1,pm10,temp_pms,hum
+-33.4569,-70.6483,25.3,2025-10-16T10:30:00,HIRIPRO-01,18.2,32.1,22.5,65.2
+-33.4571,-70.6485,28.7,2025-10-16T10:31:00,HIRIPRO-01,20.1,35.4,22.3,64.8"""
+        }
+    })
 
 # ---- WebSocket events ----
 
