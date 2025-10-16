@@ -29,7 +29,7 @@ from branca.colormap import LinearColormap
 # --- API endpoint (change project/device here) ---
 API_URL_DEFAULT = (
     "https://api-sensores.cmasccp.cl/listarDatosEstructuradosV2"
-    "?tabla=datos&disp.id_proyecto=18&disp.codigo_interno=HIRIPRO-01&limite=1000&offset=0"
+    "?tabla=datos&disp.id_proyecto=18&disp.codigo_interno=HIRIPRO-01&limite=10&offset=0"
 )
 # https://api-sensores.cmasccp.cl/listarDatosEstructuradosV2?tabla=datos&disp.id_proyecto=18&disp.codigo_interno=HIRIPRO-01&limite=1000&offset=0
 # --- Schema field names (match your API keys; rename safely here) ---
@@ -112,7 +112,7 @@ def to_float(x: Any) -> Optional[float]:
 
 def fetch_rows(url: str) -> List[Dict[str, Any]]:
     """GET API and extract the list under data.tableData (adjust here if backend changes)."""
-    r = requests.get(url, timeout=30)
+    r = requests.get(url, timeout=90)
     r.raise_for_status()
     j = r.json()
     return [row for row in j.get("data", {}).get("tableData", []) if isinstance(row, dict)]
