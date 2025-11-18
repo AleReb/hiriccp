@@ -149,3 +149,25 @@ label {
 #dlbar a:hover {
     text-decoration: underline;
 }
+
+/* Custom marker cluster styles */
+.marker-cluster-custom {
+    background: none !important;
+    border: none !important;
+}
+
+.marker-cluster-custom div {
+    box-sizing: border-box;
+}
+
+/* Override default marker cluster styles */
+.leaflet-cluster-anim .leaflet-marker-icon, 
+.leaflet-cluster-anim .leaflet-marker-shadow {
+    transition: transform 0.3s ease-out, opacity 0.3s ease-in;
+}
+
+/* Cluster hover effects */
+.marker-cluster-custom:hover div {
+    transform: scale(1.1);
+    transition: transform 0.2s ease-in-out;
+}
