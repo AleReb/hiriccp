@@ -87,7 +87,48 @@
         maxClusterRadius: 50,
         spiderfyOnMaxZoom: true,
         showCoverageOnHover: false,
-        zoomToBoundsOnClick: true
+        zoomToBoundsOnClick: true,
+        iconCreateFunction: function(cluster) {
+          // Calcular el promedio de PM2.5 de los marcadores en el cluster
+          const markers = cluster.getAllChildMarkers();
+          let totalPM25 = 0;
+          let count = 0;
+          
+          markers.forEach(marker => {
+            if (marker.pm25Value && !isNaN(marker.pm25Value)) {
+              totalPM25 += marker.pm25Value;
+              count++;
+            }
+          });
+          
+          const avgPM25 = count > 0 ? totalPM25 / count : 0;
+          const color = colorForPM(avgPM25);
+          const childCount = cluster.getChildCount();
+          
+          // Crear el ícono del cluster con color basado en promedio PM2.5
+          return new L.DivIcon({ 
+            html: `<div style="
+              background-color: ${color};
+              color: white;
+              text-align: center;
+              border-radius: 50%;
+              line-height: 40px;
+              font-weight: bold;
+              font-size: 12px;
+              width: 40px;
+              height: 40px;
+              border: 2px solid white;
+              box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+            ">
+              ${childCount}
+              <div style="font-size: 8px; line-height: 1; margin-top: -2px;">
+                ${avgPM25.toFixed(1)}
+              </div>
+            </div>`,
+            className: 'marker-cluster-custom',
+            iconSize: new L.Point(40, 40)
+          });
+        }
       });
     }
     if(!heatLayer){
@@ -169,6 +210,9 @@
       const m = L.circleMarker([lat,lon], {
         radius: 6, color: col, fillColor: col, weight: 1, fillOpacity: 0.85
       }).bindPopup(popup);
+
+      // Guardar el valor PM2.5 en el marcador para uso en clusters
+      m.pm25Value = pm25;
 
       // Add to appropriate layer
       if(useCluster && clusterLayer) {
