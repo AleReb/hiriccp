@@ -106,6 +106,9 @@ socketio = SocketIO(app, cors_allowed_origins="*", logger=True, engineio_logger=
 # Runtime state
 Logs = deque(maxlen=2000)
 
+# MEDIDA DE SEGURIDAD: Control global de locks para evitar colectores duplicados
+_collector_locks: Dict[Tuple[str,str,str], threading.Lock] = {}
+
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
     line = f"[{ts}] {msg}"
@@ -474,19 +477,62 @@ def collector_loop(key: Tuple[str,str,str], limit: int,
             Cursor[key]["last_error"] = f"{type(e).__name__}: {e}"
             log(f"[collector] error {Cursor[key]['last_error']}; sleep 5s")
             time.sleep(5.0)
+        except Exception as e:
+            # MEDIDA DE SEGURIDAD: Capturar cualquier excepción no manejada para evitar bucle infinito sin pausa
+            Cursor[key]["last_error"] = f"Unexpected error: {type(e).__name__}: {e}"
+            log(f"[collector] unexpected error {key}: {Cursor[key]['last_error']}")
+            time.sleep(2.0)
+        finally:
+            # MEDIDA DE SEGURIDAD: Pausa obligatoria al final de cada iteración para limitar CPU
+            time.sleep(0.1)  # Mínimo 100ms entre iteraciones del bucle principal
+
+def start_collector_safe(project_id: str, device_code: str, tabla: str, limit: int, reset=False) -> bool:
+    """MEDIDA DE SEGURIDAD: Versión segura que evita colectores duplicados usando locks por dispositivo"""
+    key = key_tuple(project_id, device_code, tabla)
+    
+    # MEDIDA DE SEGURIDAD: Lock per-device para evitar race conditions al crear colectores
+    if key not in _collector_locks:
+        _collector_locks[key] = threading.Lock()
+    
+    with _collector_locks[key]:
+        # MEDIDA DE SEGURIDAD: Verificar robustamente si ya existe un colector activo
+        if key in CollectorThreads:
+            thread_info = CollectorThreads[key]
+            thread = thread_info.get("thread")
+            
+            if thread and thread.is_alive():
+                log(f"[collector] SKIP: Ya existe colector activo para {key}")
+                return False
+            else:
+                # MEDIDA DE SEGURIDAD: Limpiar thread muerto antes de crear uno nuevo
+                log(f"[collector] CLEANUP: Removiendo thread muerto para {key}")
+                if thread:
+                    try:
+                        thread_info["stop"].set()
+                    except:
+                        pass
+                del CollectorThreads[key]
+        
+        # MEDIDA DE SEGURIDAD: Crear nuevo colector con nombre identificable para debugging
+        ensure_structs(key)
+        if reset:
+            purge_cache(project_id, device_code, tabla, keep_structs=True)
+        
+        stop_evt = threading.Event()
+        th = threading.Thread(
+            target=collector_loop, 
+            args=(key, int(limit)), 
+            daemon=True,
+            name=f"collector-{key[0]}-{key[1]}-{key[2]}"  # Nombre descriptivo para debugging
+        )
+        CollectorThreads[key] = {"thread": th, "stop": stop_evt}
+        th.start()
+        log(f"[collector] STARTED: Nuevo colector para {key} con limit={limit}")
+        return True
 
 def start_collector(project_id: str, device_code: str, tabla: str, limit: int, reset=False):
-    key = key_tuple(project_id, device_code, tabla)
-    ensure_structs(key)
-    if reset:
-        purge_cache(project_id, device_code, tabla, keep_structs=True)
-    if key in CollectorThreads and CollectorThreads[key]["thread"].is_alive():
-        return
-    stop_evt = threading.Event()
-    th = threading.Thread(target=collector_loop, args=(key, int(limit)), daemon=True)
-    CollectorThreads[key] = {"thread": th, "stop": stop_evt}
-    th.start()
-    log(f"[collector] started {key} with limit={limit}")
+    """MEDIDA DE SEGURIDAD: Wrapper para mantener compatibilidad con código existente"""
+    return start_collector_safe(project_id, device_code, tabla, limit, reset)
 
 def stop_collector(project_id: str, device_code: str, tabla: str):
     key = key_tuple(project_id, device_code, tabla)
@@ -581,9 +627,11 @@ def map_view():
     device_code = request.args.get("device_code", "")  # Empty by default to show all devices
     tabla = request.args.get("tabla", DEFAULT_TABLA)
 
-    # Only start collector if device_code is specified
+    # MEDIDA DE SEGURIDAD: Solo iniciar colector si device_code está especificado y no existe ya
     if device_code:
-        start_collector(project_id, device_code, tabla, DEFAULT_LIMIT, reset=False)
+        started = start_collector_safe(project_id, device_code, tabla, DEFAULT_LIMIT, reset=False)
+        if not started:
+            log(f"[map] Colector ya existe para dispositivo {device_code}")
 
     # Create Folium map with plugins
     fmap = folium.Map(location=[-33.45, -70.65], zoom_start=12, control_scale=True, prefer_canvas=True)
@@ -928,8 +976,13 @@ def admin_reindex():
     t = request.args.get("tabla", DEFAULT_TABLA)
     limit = int(request.args.get("limit", DEFAULT_LIMIT))
     reset = request.args.get("reset","0") == "1"
-    start_collector(p,d,t,limit,reset=reset)
-    return jsonify({"ok": True, "message": f"collector started for {(p,d,t)} reset={reset}, limit={limit}"})
+    # MEDIDA DE SEGURIDAD: Usar función segura para evitar colectores duplicados
+    started = start_collector_safe(p,d,t,limit,reset=reset)
+    return jsonify({
+        "ok": True, 
+        "started": started,
+        "message": f"collector {'started' if started else 'already exists'} for {(p,d,t)} reset={reset}, limit={limit}"
+    })
 
 @app.route("/admin/purge")
 def admin_purge():
@@ -948,6 +1001,100 @@ def admin_logs():
 @app.route("/healthz")
 def healthz():
     return jsonify({"ok": True})
+
+# MEDIDA DE SEGURIDAD: Endpoints de diagnóstico para detectar y resolver problemas de colectores
+@app.route('/admin/debug-duplicate-collectors')
+def debug_duplicate_collectors():
+    """MEDIDA DE SEGURIDAD: Detectar colectores duplicados y threads problemáticos"""
+    # Contar threads por nombre
+    thread_counts = {}
+    all_threads = threading.enumerate()
+    
+    for t in all_threads:
+        name = t.name
+        if 'collector' in name.lower():
+            thread_counts[name] = thread_counts.get(name, 0) + 1
+    
+    # Buscar duplicados
+    duplicates = {name: count for name, count in thread_counts.items() if count > 1}
+    
+    # Info de CollectorThreads
+    collector_status = {}
+    for key, info in CollectorThreads.items():
+        thread = info.get("thread")
+        collector_status[str(key)] = {
+            "thread_name": thread.name if thread else None,
+            "is_alive": thread.is_alive() if thread else False,
+            "thread_id": thread.ident if thread else None,
+            "stop_set": info.get("stop", threading.Event()).is_set()
+        }
+    
+    return jsonify({
+        "total_python_threads": len(all_threads),
+        "collector_threads_active": len([t for t in all_threads if 'collector' in t.name.lower()]),
+        "thread_counts": thread_counts,
+        "duplicates": duplicates,
+        "collector_status": collector_status,
+        "active_threads_names": [t.name for t in all_threads if t.is_alive()]
+    })
+
+@app.route('/admin/force-stop-all')
+def force_stop_all():
+    """MEDIDA DE SEGURIDAD: Detener TODOS los colectores de forma agresiva para resolver problemas de CPU"""
+    # 1. Marcar todos los stop events
+    stopped_count = 0
+    for key, info in list(CollectorThreads.items()):
+        try:
+            info["stop"].set()
+            stopped_count += 1
+        except:
+            pass
+    
+    # 2. Esperar un poco para que los threads terminen
+    time.sleep(1)
+    
+    # 3. Forzar limpieza del registro de colectores
+    CollectorThreads.clear()
+    _collector_locks.clear()
+    
+    # 4. Contar threads que siguen activos
+    remaining_collectors = [t for t in threading.enumerate() 
+                          if t.is_alive() and 'collector' in t.name.lower()]
+    
+    return jsonify({
+        "stop_events_set": stopped_count,
+        "threads_cleared": True,
+        "remaining_collector_threads": len(remaining_collectors),
+        "remaining_thread_names": [t.name for t in remaining_collectors],
+        "total_active_threads": threading.active_count()
+    })
+
+@app.route('/admin/collector-status')
+def collector_status():
+    """MEDIDA DE SEGURIDAD: Ver estado detallado de todos los colectores para monitoreo"""
+    status = []
+    for key, info in CollectorThreads.items():
+        thread = info.get("thread")
+        cursor = Cursor.get(key, {})
+        status.append({
+            'key': {'project_id': key[0], 'device_code': key[1], 'tabla': key[2]},
+            'thread_alive': thread.is_alive() if thread else False,
+            'thread_name': thread.name if thread else None,
+            'stop_requested': info.get("stop", threading.Event()).is_set(),
+            'cursor': {
+                'finished': cursor.get('finished', False),
+                'offset': cursor.get('offset', 0),
+                'pages': cursor.get('pages', 0),
+                'last_error': cursor.get('last_error'),
+                'last_ok_ts': cursor.get('last_ok_ts')
+            }
+        })
+    return jsonify({
+        'total_active': len([s for s in status if s['thread_alive']]),
+        'total_registered': len(status),
+        'collectors': status,
+        'total_system_threads': threading.active_count()
+    })
 
 # ---- CSV Upload and Map Generation ----
 
