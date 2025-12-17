@@ -209,3 +209,5 @@
 {"device_code": "HIRIPRO-01", "time": "2025-11-21T15:24:10", "envio_n": "6635.0", "lat": 0.0, "lon": 0.0, "pm25": 1.0, "pm1": 0.0, "pm10": 1.0, "temp_pms": 30.8, "hum": 35.3, "vbat": 0.0, "csq": 31.0, "sats": 0.0, "speed_kmh": 0.0}
 {"device_code": "HIRIPRO-01", "time": "2025-11-21T15:23:41", "envio_n": "6634.0", "lat": 0.0, "lon": 0.0, "pm25": 0.0, "pm1": 0.0, "pm10": 0.0, "temp_pms": 30.8, "hum": 35.1, "vbat": 0.0, "csq": 31.0, "sats": 0.0, "speed_kmh": 0.0}
 {"device_code": "HIRIPRO-01", "time": "2025-11-21T15:23:35", "envio_n": "6633.0", "lat": 0.0, "lon": 0.0, "pm25": 0.0, "pm1": 0.0, "pm10": 0.0, "temp_pms": 30.8, "hum": 35.3, "vbat": 0.0, "csq": 31.0, "sats": 0.0, "speed_kmh": 0.0}
+{"device_code": "HIRIPRO-01", "time": "2025-11-21T15:44:07", "envio_n": "nan", "lat": 0.0, "lon": 0.0, "pm25": 5.0, "pm1": 1.0, "pm10": 5.0, "temp_pms": 30.9, "hum": 35.5, "vbat": null, "csq": null, "sats": null, "speed_kmh": null}
+{"device_code": "HIRIPRO-01", "time": "2025-11-21T15:44:07", "envio_n": "nan", "lat": 0.0, "lon": 0.0, "pm25": 5.0, "pm1": 1.0, "pm10": 5.0, "temp_pms": 30.9, "hum": 35.5, "vbat": null, "csq": null, "sats": null, "speed_kmh": null}

@@ -56,7 +56,7 @@ DEFAULT_TABLA = "datos"
 DEFAULT_PROJECT_ID = "18"
 DEFAULT_DEVICE_CODE = "HIRIPRO-01"
 
-DEFAULT_LIMIT = 500
+DEFAULT_LIMIT = 100
 DEFAULT_CONNECT_TIMEOUT = 10
 DEFAULT_READ_TIMEOUT = 60
 DEFAULT_RETRIES = 3
@@ -107,7 +107,7 @@ socketio = SocketIO(app, cors_allowed_origins="*", logger=True, engineio_logger=
 Logs = deque(maxlen=2000)
 
 # MEDIDA DE SEGURIDAD: Control global de locks para evitar colectores duplicados
-_collector_locks: Dict[Tuple[str,str,str], threading.Lock] = {}
+_collector_lock = threading.Lock()
 
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
@@ -120,7 +120,9 @@ Days: Dict[Tuple[str,str,str], List[str]] = defaultdict(list)
 DayRows: Dict[Tuple[str,str,str], Dict[str, List[Dict[str,Any]]]] = defaultdict(lambda: defaultdict(list))
 DayFP: Dict[Tuple[str,str,str], Dict[str, set]] = defaultdict(lambda: defaultdict(set))
 Cursor: Dict[Tuple[str,str,str], Dict[str, Any]] = defaultdict(dict)
-CollectorThreads: Dict[Tuple[str,str,str], Dict[str, Any]] = {}
+
+# Single collector for selected device
+GlobalCollector: Dict[str, Any] = {}
 
 # =========================
 # ====== UTILITIES ========
@@ -393,21 +395,27 @@ def generate_html_map_from_csv_data(plotted_records: List[Dict[str, Any]], title
 # ===== COLLECTOR =========
 # =========================
 
-def collector_loop(key: Tuple[str,str,str], limit: int,
-                   connect_timeout=DEFAULT_CONNECT_TIMEOUT,
-                   read_timeout=DEFAULT_READ_TIMEOUT,
-                   verify_tls=True):
-    p, d, t = key
-    ensure_structs(key)
+def single_device_collector_loop(project_id: str, device_code: str, tabla: str, limit: int,
+                                 connect_timeout=DEFAULT_CONNECT_TIMEOUT,
+                                 read_timeout=DEFAULT_READ_TIMEOUT,
+                                 verify_tls=True):
+    """Colector que recolecta datos solo del dispositivo seleccionado"""
+    key = key_tuple(project_id, device_code, tabla)
     session = make_session()
-    stop = CollectorThreads[key]["stop"]
-
-    while not stop.is_set():
-        cur = Cursor[key]
+    stop_event = GlobalCollector["stop"]
+    
+    log(f"[collector] INICIANDO colector para device específico: {device_code}")
+    
+    while not stop_event.is_set():
         try:
+            ensure_structs(key)
+            cur = Cursor[key]
+            
+            # Procesar solo el device seleccionado
             if not cur.get("finished", False):
+                # Recolección inicial/paginada
                 offset = int(cur.get("offset", 0))
-                url = build_upstream_url(p, d, t, limit, offset)
+                url = build_upstream_url(project_id, device_code, tabla, limit, offset)
                 resp = session.get(url, timeout=(connect_timeout, read_timeout), verify=verify_tls, stream=False)
 
                 payload = {}
@@ -421,7 +429,7 @@ def collector_loop(key: Tuple[str,str,str], limit: int,
                     cur["last_ok_ts"] = time.time()
                     cur["last_error"] = None
                     cur["last_url"] = url
-                    log(f"[collector] end (no records) {key}")
+                    log(f"[collector] {device_code}: end (no records)")
                     time.sleep(HEAD_POLL_SECONDS)
                     continue
 
@@ -440,94 +448,101 @@ def collector_loop(key: Tuple[str,str,str], limit: int,
                 cur["last_ok_ts"] = time.time()
                 cur["last_error"] = None
                 cur["last_url"] = url
-                log(f"[collector] page#{cur['pages']} offset={offset} got={n} plotted+={sum(added.values())} days+={list(added.keys())}")
+                log(f"[collector] {device_code}: page#{cur['pages']} offset={offset} got={n} plotted+={sum(added.values())} days+={list(added.keys())}")
+                
+                # Pausa entre requests para no saturar la API
                 time.sleep(0.2 if not cur["finished"] else HEAD_POLL_SECONDS)
                 continue
 
-            # Head polling
-            url = build_upstream_url(p, d, t, limit, 0)
-            resp = session.get(url, timeout=(connect_timeout, read_timeout), verify=verify_tls, stream=False)
-            payload = {}
-            try:
-                payload = resp.json()
-            except Exception:
-                resp.raise_for_status()
-            if resp.status_code == 400 and is_no_records_payload(payload):
-                time.sleep(HEAD_POLL_SECONDS)
-                continue
-
-            resp.raise_for_status()
-            raw_rows = extract_rows(payload)
-            plotted = process_raw_to_plotted(raw_rows)
-            added = add_to_day_cache(key, plotted)
-            if sum(added.values()) > 0:
-                log(f"[collector] head append +{sum(added.values())} rows days+={list(added.keys())}")
+            else:
+                # Head polling para dispositivo terminado
+                url = build_upstream_url(project_id, device_code, tabla, limit, 0)
+                resp = session.get(url, timeout=(connect_timeout, read_timeout), verify=verify_tls, stream=False)
+                payload = {}
                 try:
-                    socketio.emit('new_data', {
-                        'key': {'project_id': p, 'device_code': d, 'tabla': t},
-                        'rows': plotted,
-                        'count': sum(added.values()),
-                        'days': list(added.keys())
-                    }, namespace='/')
-                except Exception as e:
-                    log(f"[websocket] Error emitting: {e}")
-            time.sleep(HEAD_POLL_SECONDS)
+                    payload = resp.json()
+                except Exception:
+                    resp.raise_for_status()
+                if resp.status_code == 400 and is_no_records_payload(payload):
+                    time.sleep(HEAD_POLL_SECONDS)
+                    continue
+
+                resp.raise_for_status()
+                raw_rows = extract_rows(payload)
+                plotted = process_raw_to_plotted(raw_rows)
+                added = add_to_day_cache(key, plotted)
+                if sum(added.values()) > 0:
+                    log(f"[collector] {device_code}: head append +{sum(added.values())} rows days+={list(added.keys())}")
+                    try:
+                        socketio.emit('new_data', {
+                            'key': {'project_id': project_id, 'device_code': device_code, 'tabla': tabla},
+                            'rows': plotted,
+                            'count': sum(added.values()),
+                            'days': list(added.keys())
+                        }, namespace='/')
+                    except Exception as e:
+                        log(f"[websocket] Error emitting: {e}")
+                
+                time.sleep(HEAD_POLL_SECONDS)
 
         except requests.exceptions.RequestException as e:
             Cursor[key]["last_error"] = f"{type(e).__name__}: {e}"
-            log(f"[collector] error {Cursor[key]['last_error']}; sleep 5s")
+            log(f"[collector] error en {device_code}: {Cursor[key]['last_error']}; sleep 5s")
             time.sleep(5.0)
         except Exception as e:
             # MEDIDA DE SEGURIDAD: Capturar cualquier excepción no manejada para evitar bucle infinito sin pausa
-            Cursor[key]["last_error"] = f"Unexpected error: {type(e).__name__}: {e}"
-            log(f"[collector] unexpected error {key}: {Cursor[key]['last_error']}")
+            error_msg = f"Unexpected error: {type(e).__name__}: {e}"
+            Cursor[key]["last_error"] = error_msg
+            log(f"[collector] unexpected error en {device_code}: {error_msg}")
             time.sleep(2.0)
         finally:
             # MEDIDA DE SEGURIDAD: Pausa obligatoria al final de cada iteración para limitar CPU
             time.sleep(0.1)  # Mínimo 100ms entre iteraciones del bucle principal
+    
+    log(f"[collector] FINALIZANDO colector para device: {device_code}")
 
 def start_collector_safe(project_id: str, device_code: str, tabla: str, limit: int, reset=False) -> bool:
-    """MEDIDA DE SEGURIDAD: Versión segura que evita colectores duplicados usando locks por dispositivo"""
+    """MEDIDA DE SEGURIDAD: Versión que inicia colector solo para el dispositivo especificado"""
     key = key_tuple(project_id, device_code, tabla)
     
-    # MEDIDA DE SEGURIDAD: Lock per-device para evitar race conditions al crear colectores
-    if key not in _collector_locks:
-        _collector_locks[key] = threading.Lock()
-    
-    with _collector_locks[key]:
-        # MEDIDA DE SEGURIDAD: Verificar robustamente si ya existe un colector activo
-        if key in CollectorThreads:
-            thread_info = CollectorThreads[key]
-            thread = thread_info.get("thread")
-            
-            if thread and thread.is_alive():
-                log(f"[collector] SKIP: Ya existe colector activo para {key}")
-                return False
-            else:
-                # MEDIDA DE SEGURIDAD: Limpiar thread muerto antes de crear uno nuevo
-                log(f"[collector] CLEANUP: Removiendo thread muerto para {key}")
-                if thread:
-                    try:
-                        thread_info["stop"].set()
-                    except:
-                        pass
-                del CollectorThreads[key]
-        
-        # MEDIDA DE SEGURIDAD: Crear nuevo colector con nombre identificable para debugging
+    # MEDIDA DE SEGURIDAD: Lock global para evitar race conditions al crear colector
+    with _collector_lock:
         ensure_structs(key)
         if reset:
             purge_cache(project_id, device_code, tabla, keep_structs=True)
         
+        # MEDIDA DE SEGURIDAD: Verificar si ya existe un colector global activo
+        if GlobalCollector.get("thread") and GlobalCollector["thread"].is_alive():
+            # Si ya existe un colector, verificar si es para el mismo device
+            current_device = GlobalCollector.get("device_code", "")
+            if current_device == device_code:
+                log(f"[collector] SKIP: Ya existe colector activo para dispositivo {device_code}")
+                return False
+            else:
+                # Detener colector actual para iniciar uno nuevo
+                log(f"[collector] Deteniendo colector actual ({current_device}) para iniciar colector para {device_code}")
+                try:
+                    GlobalCollector["stop"].set()
+                    time.sleep(1)  # Esperar a que termine
+                except:
+                    pass
+                GlobalCollector.clear()
+        
+        # MEDIDA DE SEGURIDAD: Crear nuevo colector único con nombre identificable para debugging
         stop_evt = threading.Event()
         th = threading.Thread(
-            target=collector_loop, 
-            args=(key, int(limit)), 
+            target=single_device_collector_loop, 
+            args=(project_id, device_code, tabla, int(limit)), 
             daemon=True,
-            name=f"collector-{key[0]}-{key[1]}-{key[2]}"  # Nombre descriptivo para debugging
+            name=f"collector-{device_code}"  # Nombre descriptivo para debugging
         )
-        CollectorThreads[key] = {"thread": th, "stop": stop_evt}
+        GlobalCollector["thread"] = th
+        GlobalCollector["stop"] = stop_evt
+        GlobalCollector["project_id"] = project_id
+        GlobalCollector["device_code"] = device_code
+        GlobalCollector["tabla"] = tabla
         th.start()
-        log(f"[collector] STARTED: Nuevo colector para {key} con limit={limit}")
+        log(f"[collector] STARTED: Colector único para dispositivo {device_code} con limit={limit}")
         return True
 
 def start_collector(project_id: str, device_code: str, tabla: str, limit: int, reset=False):
@@ -535,15 +550,20 @@ def start_collector(project_id: str, device_code: str, tabla: str, limit: int, r
     return start_collector_safe(project_id, device_code, tabla, limit, reset)
 
 def stop_collector(project_id: str, device_code: str, tabla: str):
-    key = key_tuple(project_id, device_code, tabla)
-    info = CollectorThreads.get(key)
-    if not info: return
-    info["stop"].set()
-    log(f"[collector] stop requested {key}")
+    """Detener colector del dispositivo especificado"""
+    with _collector_lock:
+        # Verificar si el colector actual corresponde al dispositivo especificado
+        current_device = GlobalCollector.get("device_code", "")
+        if current_device == device_code and GlobalCollector.get("thread"):
+            GlobalCollector["stop"].set()
+            log(f"[collector] Deteniendo colector para dispositivo {device_code}")
+        else:
+            log(f"[collector] No hay colector activo para dispositivo {device_code} (activo: {current_device})")
 
 def purge_cache(project_id: str, device_code: str, tabla: str, keep_structs=False):
     key = key_tuple(project_id, device_code, tabla)
     stop_collector(project_id, device_code, tabla)
+    
     if not keep_structs:
         Days.pop(key, None)
         DayRows.pop(key, None)
@@ -605,10 +625,10 @@ def scan_and_load_all_devices(project_id: str, tabla: str) -> List[str]:
     return devices_found
 
 def start_collectors_for_all_devices(project_id: str, tabla: str, limit: int):
-    """Start collectors for all known devices."""
+    """Cargar devices disponibles pero no iniciar colector automáticamente."""
     devices = scan_and_load_all_devices(project_id, tabla)
-    for device in devices:
-        start_collector(project_id, device, tabla, limit, reset=False)
+    log(f"[startup] Devices disponibles: {devices}")
+    log(f"[startup] Para recolectar datos, seleccione un dispositivo específico en la interfaz")
     return devices
 
 # =========================
@@ -1018,15 +1038,18 @@ def debug_duplicate_collectors():
     # Buscar duplicados
     duplicates = {name: count for name, count in thread_counts.items() if count > 1}
     
-    # Info de CollectorThreads
-    collector_status = {}
-    for key, info in CollectorThreads.items():
-        thread = info.get("thread")
-        collector_status[str(key)] = {
+    # Info del colector global
+    global_collector_status = {}
+    if GlobalCollector.get("thread"):
+        thread = GlobalCollector["thread"]
+        global_collector_status = {
             "thread_name": thread.name if thread else None,
             "is_alive": thread.is_alive() if thread else False,
             "thread_id": thread.ident if thread else None,
-            "stop_set": info.get("stop", threading.Event()).is_set()
+            "stop_set": GlobalCollector.get("stop", threading.Event()).is_set(),
+            "project_id": GlobalCollector.get("project_id", "Unknown"),
+            "device_code": GlobalCollector.get("device_code", "Unknown"),
+            "tabla": GlobalCollector.get("tabla", "Unknown")
         }
     
     return jsonify({
@@ -1034,28 +1057,28 @@ def debug_duplicate_collectors():
         "collector_threads_active": len([t for t in all_threads if 'collector' in t.name.lower()]),
         "thread_counts": thread_counts,
         "duplicates": duplicates,
-        "collector_status": collector_status,
+        "global_collector_status": global_collector_status,
         "active_threads_names": [t.name for t in all_threads if t.is_alive()]
     })
 
 @app.route('/admin/force-stop-all')
 def force_stop_all():
-    """MEDIDA DE SEGURIDAD: Detener TODOS los colectores de forma agresiva para resolver problemas de CPU"""
-    # 1. Marcar todos los stop events
+    """MEDIDA DE SEGURIDAD: Detener el colector global de forma agresiva para resolver problemas de CPU"""
+    # 1. Marcar stop event del colector global
     stopped_count = 0
-    for key, info in list(CollectorThreads.items()):
-        try:
-            info["stop"].set()
-            stopped_count += 1
-        except:
-            pass
+    with _collector_lock:
+        if GlobalCollector.get("stop"):
+            try:
+                GlobalCollector["stop"].set()
+                stopped_count = 1
+            except:
+                pass
+        
+        # 2. Limpiar estructura global
+        GlobalCollector.clear()
     
-    # 2. Esperar un poco para que los threads terminen
+    # 3. Esperar un poco para que el thread termine
     time.sleep(1)
-    
-    # 3. Forzar limpieza del registro de colectores
-    CollectorThreads.clear()
-    _collector_locks.clear()
     
     # 4. Contar threads que siguen activos
     remaining_collectors = [t for t in threading.enumerate() 
@@ -1071,16 +1094,26 @@ def force_stop_all():
 
 @app.route('/admin/collector-status')
 def collector_status():
-    """MEDIDA DE SEGURIDAD: Ver estado detallado de todos los colectores para monitoreo"""
-    status = []
-    for key, info in CollectorThreads.items():
-        thread = info.get("thread")
+    """MEDIDA DE SEGURIDAD: Ver estado detallado del colector global para monitoreo"""
+    # Estado del colector global
+    global_status = None
+    if GlobalCollector.get("thread"):
+        thread = GlobalCollector["thread"]
+        device_code = GlobalCollector.get("device_code", "Unknown")
+        project_id = GlobalCollector.get("project_id", "Unknown")
+        tabla = GlobalCollector.get("tabla", "Unknown")
+        
+        # Obtener estado del cursor para el dispositivo actual
+        key = key_tuple(project_id, device_code, tabla)
         cursor = Cursor.get(key, {})
-        status.append({
-            'key': {'project_id': key[0], 'device_code': key[1], 'tabla': key[2]},
+        
+        global_status = {
             'thread_alive': thread.is_alive() if thread else False,
             'thread_name': thread.name if thread else None,
-            'stop_requested': info.get("stop", threading.Event()).is_set(),
+            'stop_requested': GlobalCollector.get("stop", threading.Event()).is_set(),
+            'project_id': project_id,
+            'device_code': device_code,
+            'tabla': tabla,
             'cursor': {
                 'finished': cursor.get('finished', False),
                 'offset': cursor.get('offset', 0),
@@ -1088,11 +1121,10 @@ def collector_status():
                 'last_error': cursor.get('last_error'),
                 'last_ok_ts': cursor.get('last_ok_ts')
             }
-        })
+        }
+    
     return jsonify({
-        'total_active': len([s for s in status if s['thread_alive']]),
-        'total_registered': len(status),
-        'collectors': status,
+        'global_collector': global_status,
         'total_system_threads': threading.active_count()
     })
 
